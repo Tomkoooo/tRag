@@ -3,12 +3,12 @@
 A fully local Retrieval-Augmented Generation system for NIS2 audit compliance.
 Runs entirely on a MacBook Air M4 (16 GB unified memory) with no cloud dependencies.
 
-| Component   | Technology                          |
-| ----------- | ----------------------------------- |
-| LLM         | Ollama — `llama3.1:8b`             |
-| Embeddings  | HuggingFace — `BAAI/bge-m3`       |
-| RAG         | LlamaIndex                          |
-| UI          | Streamlit                           |
+| Component   | Technology                     |
+| ----------- | ------------------------------ |
+| LLM         | Ollama (model-selectable)      |
+| Embeddings  | HuggingFace — `BAAI/bge-m3`    |
+| RAG         | LlamaIndex                     |
+| UI          | Streamlit                      |
 
 ---
 
@@ -119,7 +119,7 @@ The first startup downloads `BAAI/bge-m3` (~2.3 GB) to `~/.cache/huggingface/`.
 ### M4-specific notes
 
 - **Metal acceleration**: Ollama uses Metal on Apple Silicon by default (no extra config needed).
-- **Memory headroom**: `llama3.1:8b` + `BAAI/bge-m3` typically stays in a safe range for 16 GB when using current defaults (`CHUNK_SIZE=1024`, `TOP_K=6`).
+- **Memory headroom**: `llama3.1:8b` + `BAAI/bge-m3` typically stays in a safe range for 16 GB when using current defaults (`CHUNK_SIZE=1024`, `TOP_K=4`).
 - **Monitor usage**: Use *Activity Monitor → Memory* and keep pressure green/yellow.
 
 ### Install Debug Info (if something fails)
@@ -154,16 +154,20 @@ The browser opens at `http://localhost:8501`.
 1. In the **sidebar**, drag & drop PDF, DOCX, or TXT files into the upload area.
 2. Click **Save & Index**. A spinner appears while documents are chunked, embedded, and stored.
 3. The index is persisted to the `storage/` directory — restarting the app reloads it instantly.
+4. A compatibility check runs for stored indexes:
+   - If metadata is missing (legacy index), querying is allowed with a warning.
+   - If embedding model mismatch is detected, querying is blocked and **Re-index All** is required.
 
 ### Ask questions (Chat tab)
 
-Type a question in the chat input. The system retrieves the most relevant chunks (top-k = 6), sends them to the LLM with a NIS2-focused prompt, and returns an answer with evidence.
+Type a question in the chat input. The system retrieves relevant chunks (default top-k = 4), uses `compact` response synthesis for speed, and returns an answer with evidence.
 
 Each evidence block shows:
 - Source **file name**
 - **Page number** (for PDFs)
 - **Relevance score**
 - A short **excerpt** from the chunk
+- **Response time (seconds)** for quick latency feedback
 
 ### Batch processing (Batch tab)
 
@@ -171,7 +175,37 @@ Each evidence block shows:
 2. Select which column contains the questions.
 3. Click **Process All Questions**.
 4. A progress bar tracks completion.
-5. Download results as CSV or Excel. Output columns: `question`, `answer`, `evidence_files`, `evidence_excerpts`.
+5. Download results as CSV or Excel. Output columns: `question`, `answer`, `response_seconds`, `evidence_files`, `evidence_excerpts`.
+
+### Model selection and download
+
+The sidebar now includes:
+
+- **Model profile** (Balanced/Fast/Alternative Fast/Heavy)
+- **Model tag** input (custom Ollama model tag)
+- **Installed models** list (from `http://localhost:11434/api/tags`)
+- **Download selected model** button (uses Ollama pull API with progress)
+
+If a selected model is not installed, chat and batch processing are paused until the model is downloaded.
+
+### Performance controls (M4 optimization)
+
+The sidebar exposes runtime controls to avoid slow responses/timeouts:
+
+- `top_k` (default 4, max 6)
+- `max output tokens` (`num_predict`)
+- `request timeout`
+- `keep_alive` (keeps model warm between questions)
+- `temperature`
+- `Performance mode` (Speed/Balanced)
+
+Recommended order if responses are slow:
+
+1. Switch profile to **Fast** (`llama3.2:3b`)
+2. Reduce `top_k` to 3
+3. Reduce max output tokens to 192-256
+4. Keep model warm with `keep_alive` >= 15m
+5. Retry the same query and compare response time
 
 ---
 
@@ -257,9 +291,9 @@ All incidents must be reported to the national CSIRT within 72 hours.
 2. Stop the Streamlit app (`Ctrl+C`).
 3. Restart with `streamlit run app.py`.
 
-**Expected output:** The sidebar should show "Index loaded and ready" without re-indexing. Queries should work immediately.
+**Expected output:** The sidebar should show index loaded status without re-indexing. Queries should work immediately.
 
-**Verify:** Check that `storage/` contains `docstore.json`, `index_store.json`, and `default__vector_store.json`.
+**Verify:** Check that `storage/` contains `docstore.json`, `index_store.json`, `default__vector_store.json`, and `index_meta.json`.
 
 ### Test 5 — Memory stress test
 
@@ -272,9 +306,10 @@ All incidents must be reported to the national CSIRT within 72 hours.
 **Expected output:** Memory pressure stays in the green/yellow zone. Total memory used by Python + Ollama stays below ~13 GB.
 
 **Troubleshooting if memory is too high:**
-- Reduce `TOP_K` from 6 to 3 in `app.py`.
-- Use a smaller model: change `LLM_MODEL` to `"llama3.2:3b"`.
-- Reduce `CHUNK_SIZE` to 512.
+- Use Fast profile (`llama3.2:3b`).
+- Reduce `top_k` from 4 to 3.
+- Reduce max output tokens to 160-220.
+- Keep chunk size at 1024 unless you are reindexing intentionally.
 - Close other applications consuming memory.
 
 ---
@@ -285,9 +320,12 @@ All incidents must be reported to the national CSIRT within 72 hours.
 | --- | --- |
 | "Cannot reach Ollama" in sidebar | Run `ollama serve` in a terminal |
 | Model not found | Run `ollama pull llama3.1:8b` |
-| Slow first query | Normal — the embedding model loads on first use |
-| Out-of-memory (app killed) | Reduce `TOP_K`, `CHUNK_SIZE`, or switch to a smaller LLM |
+| Selected model missing | Use **Download selected model** in sidebar or `ollama pull <model>` |
+| Slow first query | Normal on cold start; keep model warm with `keep_alive` |
+| Second query times out | Use Speed mode, reduce top_k/output tokens, and increase timeout |
+| Out-of-memory (app killed) | Switch to Fast profile and reduce output tokens |
 | Index seems stale after adding new files | Click **Re-index All** in the sidebar |
+| Index compatibility failed | Re-index All (embedding mismatch detected) |
 | Excel download is empty | Ensure you selected the correct question column |
 
 ---
