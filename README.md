@@ -186,9 +186,24 @@ Each evidence block shows:
 
 1. Upload an Excel (`.xlsx`) or CSV file with a column of questions.
 2. Select which column contains the questions.
-3. Click **Process All Questions**.
-4. A progress bar tracks completion.
-5. Download results as CSV or Excel. Output columns include `row_id`, `question`, `answer`, `answer_status`, `response_seconds`, `source_backlinks`, and proof excerpts.
+3. Configure anti-hallucination controls:
+   - `No-answer retrieval score threshold`
+   - `Photo-proof keywords`
+4. Click **Create Job**, then **Start / Resume**.
+5. Export results at any time while running or paused.
+
+### Anti-hallucination policy (strict)
+
+The batch pipeline marks a row as `no_answer` when **either** of these is true:
+
+- Retrieval score is below the configured threshold.
+- Generated text contains insufficient-evidence markers.
+
+For `no_answer` rows, the system does not guess. It writes:
+
+- `answer = "Insufficient evidence in indexed documents."`
+- `needs_document_request = true`
+- `document_request_reason` for routing
 
 ### Overnight batch workflow (8-12h safe run)
 
@@ -215,8 +230,14 @@ Each evidence block shows:
 - `answers_only.csv`
 - `answers_only.xlsx`
 - `merge_with_original.xlsx`
+- `document_requests.csv`
+- `document_requests.xlsx`
+- `photo_proof_requests.csv`
+- `photo_proof_requests.xlsx`
 
 All are generated under `batch_runs/<job_id>/` and can be exported mid-run.
+
+Use `document_requests.*` when asking the audited company for missing documentation.
 
 ### Index export/import
 
@@ -387,6 +408,9 @@ All incidents must be reported to the national CSIRT within 72 hours.
 | Overnight batch interrupted | Load same job from Batch tab and click **Start / Resume** |
 | OCR returns empty text | Ensure image quality is high and Tesseract is installed |
 | `pytesseract` error about binary | Install `tesseract` via Homebrew and restart terminal |
+| Too many rows marked `no_answer` | Lower threshold slightly (example: `0.22` -> `0.18`) |
+| Answers look speculative | Raise threshold and keep strict no-answer routing enabled |
+| Photo-proof rows not detected | Expand photo keyword list in Batch tab |
 
 ---
 

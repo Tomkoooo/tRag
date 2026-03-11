@@ -58,6 +58,26 @@ MAX_TOP_K = 6
 OLLAMA_API_BASE = "http://localhost:11434"
 SUPPORTED_DOC_EXTS = {".pdf", ".docx", ".txt"}
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
+DEFAULT_NO_ANSWER_SCORE_THRESHOLD = 0.22
+DEFAULT_NO_ANSWER_TEXT = "Insufficient evidence in indexed documents."
+DEFAULT_PHOTO_KEYWORDS = [
+    "photo",
+    "screenshot",
+    "image",
+    "képernyő",
+    "fénykép",
+    "bizonyíték",
+    "proof",
+    "evidence",
+]
+NO_ANSWER_MARKERS = [
+    "insufficient evidence",
+    "not enough information",
+    "cannot determine",
+    "nincs elegendő információ",
+    "nem található",
+    "nincs bizonyíték",
+]
 
 MODEL_PROFILES = {
     "Balanced (recommended)": {
@@ -436,6 +456,31 @@ def evidence_to_audit_fields(evidence: list[dict], max_excerpts: int = 3) -> dic
     return payload
 
 
+def detect_photo_proof_requirement(question: str, photo_keywords: list[str]) -> tuple[bool, str]:
+    text = question.lower()
+    for keyword in photo_keywords:
+        token = keyword.strip().lower()
+        if token and token in text:
+            return True, token
+    return False, ""
+
+
+def classify_no_answer(answer: str, evidence: list[dict], threshold: float) -> tuple[bool, str]:
+    scores = [e["score"] for e in evidence if e.get("score") is not None]
+    max_score = max(scores) if scores else 0.0
+    retrieval_low = max_score < threshold
+    answer_lc = answer.lower()
+    llm_insufficient = any(marker in answer_lc for marker in NO_ANSWER_MARKERS)
+
+    reasons = []
+    if retrieval_low:
+        reasons.append(f"low_retrieval_score<{threshold}")
+    if llm_insufficient:
+        reasons.append("llm_insufficient_evidence_marker")
+
+    return (retrieval_low or llm_insufficient), "; ".join(reasons) if reasons else ""
+
+
 def render_evidence(evidence: list[dict]) -> None:
     if not evidence:
         return
@@ -461,6 +506,10 @@ def job_paths(job_id: str) -> dict[str, Path]:
         "input": root / "input_questions.csv",
         "answers_csv": root / "answers_only.csv",
         "answers_xlsx": root / "answers_only.xlsx",
+        "document_requests_csv": root / "document_requests.csv",
+        "document_requests_xlsx": root / "document_requests.xlsx",
+        "photo_proof_requests_csv": root / "photo_proof_requests.csv",
+        "photo_proof_requests_xlsx": root / "photo_proof_requests.xlsx",
         "merged_xlsx": root / "merge_with_original.xlsx",
         "partial_xlsx": root / "job_output_partial.xlsx",
     }
@@ -495,6 +544,8 @@ def create_job(
     prior_answers_df: pd.DataFrame | None,
     reaudit_mode: bool,
     rerun_statuses: list[str],
+    no_answer_score_threshold: float,
+    photo_keywords: list[str],
 ) -> str:
     ensure_dir(BATCH_RUNS_DIR)
     job_id = datetime.now().strftime("job_%Y%m%d_%H%M%S")
@@ -531,6 +582,8 @@ def create_job(
             "resume_mode": resume_mode,
             "reaudit_mode": reaudit_mode,
             "rerun_statuses": rerun_statuses,
+            "no_answer_score_threshold": float(no_answer_score_threshold),
+            "photo_keywords": photo_keywords,
             "app_version": APP_VERSION,
         },
     )
@@ -597,16 +650,36 @@ def export_job_outputs(job_id: str) -> dict[str, Path]:
     if df_progress.empty:
         empty = pd.DataFrame(columns=["row_id", "question", "answer", "answer_status"])
         empty.to_csv(paths["answers_csv"], index=False)
+        empty.to_csv(paths["document_requests_csv"], index=False)
+        empty.to_csv(paths["photo_proof_requests_csv"], index=False)
         with pd.ExcelWriter(paths["answers_xlsx"], engine="openpyxl") as writer:
             empty.to_excel(writer, index=False, sheet_name="answers")
+        with pd.ExcelWriter(paths["document_requests_xlsx"], engine="openpyxl") as writer:
+            empty.to_excel(writer, index=False, sheet_name="document_requests")
+        with pd.ExcelWriter(paths["photo_proof_requests_xlsx"], engine="openpyxl") as writer:
+            empty.to_excel(writer, index=False, sheet_name="photo_proof_requests")
         with pd.ExcelWriter(paths["merged_xlsx"], engine="openpyxl") as writer:
             df_input.to_excel(writer, index=False, sheet_name="merged")
         return paths
 
     df_answers = df_progress.sort_values("source_row_index").drop_duplicates("row_id", keep="last")
+    if "needs_document_request" in df_answers.columns:
+        df_doc_requests = df_answers[df_answers["needs_document_request"] == True].copy()
+    else:
+        df_doc_requests = df_answers.iloc[0:0].copy()
+    if "requires_photo_proof" in df_answers.columns:
+        df_photo_requests = df_answers[df_answers["requires_photo_proof"] == True].copy()
+    else:
+        df_photo_requests = df_answers.iloc[0:0].copy()
     df_answers.to_csv(paths["answers_csv"], index=False)
+    df_doc_requests.to_csv(paths["document_requests_csv"], index=False)
+    df_photo_requests.to_csv(paths["photo_proof_requests_csv"], index=False)
     with pd.ExcelWriter(paths["answers_xlsx"], engine="openpyxl") as writer:
         df_answers.to_excel(writer, index=False, sheet_name="answers")
+    with pd.ExcelWriter(paths["document_requests_xlsx"], engine="openpyxl") as writer:
+        df_doc_requests.to_excel(writer, index=False, sheet_name="document_requests")
+    with pd.ExcelWriter(paths["photo_proof_requests_xlsx"], engine="openpyxl") as writer:
+        df_photo_requests.to_excel(writer, index=False, sheet_name="photo_proof_requests")
     merged = df_input.merge(df_answers, on=["row_id", "source_row_index", "question"], how="left")
     with pd.ExcelWriter(paths["merged_xlsx"], engine="openpyxl") as writer:
         merged.to_excel(writer, index=False, sheet_name="merged")
@@ -624,6 +697,10 @@ def process_batch_step(
     sleep_ms: int,
     autosave_every: int,
 ) -> dict:
+    meta = safe_read_json(job_paths(job_id)["meta"], default={}) or {}
+    no_answer_threshold = float(meta.get("no_answer_score_threshold", DEFAULT_NO_ANSWER_SCORE_THRESHOLD))
+    photo_keywords = meta.get("photo_keywords", DEFAULT_PHOTO_KEYWORDS)
+
     df_input = load_job_input(job_id)
     checkpoint = load_checkpoint(job_id)
     processed_set = set(checkpoint.get("processed_row_ids", []))
@@ -646,13 +723,25 @@ def process_batch_step(
         status = "ok"
         evidence = []
         answer = ""
+        needs_document_request = False
+        document_request_reason = ""
+        requires_photo_proof, photo_proof_reason = detect_photo_proof_requirement(question, photo_keywords)
+        photo_proof_status = "not_provided" if requires_photo_proof else "not_required"
         try:
             response = query_engine.query(question)
             answer = str(response).strip()
             evidence = format_evidence(response.source_nodes)
+            is_no_answer, no_answer_reason = classify_no_answer(answer, evidence, threshold=no_answer_threshold)
+            if is_no_answer:
+                status = "no_answer"
+                answer = DEFAULT_NO_ANSWER_TEXT
+                needs_document_request = True
+                document_request_reason = no_answer_reason
         except Exception as exc:
             status = "error"
             answer = f"ERROR: {exc}"
+            needs_document_request = True
+            document_request_reason = "runtime_error"
 
         audit = evidence_to_audit_fields(evidence)
         append_progress_row(
@@ -665,6 +754,12 @@ def process_batch_step(
                 "answer": answer,
                 "answer_status": status,
                 "response_seconds": round(time.perf_counter() - started, 3),
+                "needs_document_request": needs_document_request,
+                "document_request_reason": document_request_reason,
+                "requires_photo_proof": requires_photo_proof,
+                "photo_proof_status": photo_proof_status,
+                "photo_proof_reason": photo_proof_reason,
+                "needs_manual_photo_collection": requires_photo_proof,
                 "model_used": model_tag,
                 "top_k_used": top_k,
                 "processed_at_utc": now_utc_iso(),
@@ -844,10 +939,24 @@ def render_batch_tab(ollama_ok: bool, installed_models: list[str], selected_mode
         st.dataframe(df_input, use_container_width=True)
         question_col = st.selectbox("Question column", list(df_input.columns), index=0)
     resume_mode = st.selectbox("Resume mode", ["checkpoint", "append", "both"], index=2)
+    no_answer_score_threshold = st.slider(
+        "No-answer retrieval score threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=DEFAULT_NO_ANSWER_SCORE_THRESHOLD,
+        step=0.01,
+        help="Mark as no-answer when best evidence score is below this threshold, or model indicates insufficient evidence.",
+    )
+    photo_keywords_raw = st.text_area(
+        "Photo-proof keywords (comma separated)",
+        value=", ".join(DEFAULT_PHOTO_KEYWORDS),
+        help="If a question contains one of these keywords, it will be flagged for manual photo proof collection.",
+    )
+    photo_keywords = [k.strip() for k in photo_keywords_raw.split(",") if k.strip()]
     prior_answers_file = st.file_uploader("Optional prior answers (for append/re-audit)", type=["xlsx", "csv"], key="prior_answers_upload")
     prior_df = load_dataframe_from_upload(prior_answers_file) if prior_answers_file is not None else None
     reaudit_mode = st.checkbox("Re-audit mode", value=False)
-    rerun_statuses = st.multiselect("Rerun statuses", ["error", "", "skipped", "ok"], default=["error", ""])
+    rerun_statuses = st.multiselect("Rerun statuses", ["error", "no_answer", "", "skipped", "ok"], default=["error", "no_answer", ""])
     if st.button("Create Job", disabled=df_input is None or question_col is None, use_container_width=True):
         st.session_state.current_job_id = create_job(
             df_input=df_input,
@@ -858,6 +967,8 @@ def render_batch_tab(ollama_ok: bool, installed_models: list[str], selected_mode
             prior_answers_df=prior_df,
             reaudit_mode=reaudit_mode,
             rerun_statuses=rerun_statuses,
+            no_answer_score_threshold=no_answer_score_threshold,
+            photo_keywords=photo_keywords,
         )
         st.session_state.batch_running = False
         st.success(f"Created job `{st.session_state.current_job_id}`")
@@ -895,7 +1006,7 @@ def render_batch_tab(ollama_ok: bool, installed_models: list[str], selected_mode
         st.success("Outputs exported.")
 
     out = export_job_outputs(job_id)
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4, d5 = st.columns(5)
     with d1:
         if out["answers_csv"].exists():
             st.download_button("answers_only.csv", out["answers_csv"].read_bytes(), f"{job_id}_answers_only.csv", "text/csv", use_container_width=True)
@@ -905,6 +1016,12 @@ def render_batch_tab(ollama_ok: bool, installed_models: list[str], selected_mode
     with d3:
         if out["merged_xlsx"].exists():
             st.download_button("merge_with_original.xlsx", out["merged_xlsx"].read_bytes(), f"{job_id}_merge_with_original.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    with d4:
+        if out["document_requests_xlsx"].exists():
+            st.download_button("document_requests.xlsx", out["document_requests_xlsx"].read_bytes(), f"{job_id}_document_requests.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    with d5:
+        if out["photo_proof_requests_xlsx"].exists():
+            st.download_button("photo_proof_requests.xlsx", out["photo_proof_requests_xlsx"].read_bytes(), f"{job_id}_photo_proof_requests.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
     if st.session_state.batch_running:
         qe = get_cached_query_engine(st.session_state.index, qe_signature)
