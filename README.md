@@ -9,6 +9,7 @@ Runs entirely on a MacBook Air M4 (16 GB unified memory) with no cloud dependenc
 | Embeddings  | HuggingFace — `BAAI/bge-m3`    |
 | RAG         | LlamaIndex                     |
 | UI          | Streamlit                      |
+| Batch       | Checkpointed resumable jobs    |
 
 ---
 
@@ -108,6 +109,18 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
+For image OCR support:
+
+```bash
+brew install tesseract
+```
+
+Optional Hungarian OCR language data:
+
+```bash
+brew install tesseract-lang
+```
+
 ### 7. First run (downloads embeddings cache)
 
 ```bash
@@ -175,7 +188,51 @@ Each evidence block shows:
 2. Select which column contains the questions.
 3. Click **Process All Questions**.
 4. A progress bar tracks completion.
-5. Download results as CSV or Excel. Output columns: `question`, `answer`, `response_seconds`, `evidence_files`, `evidence_excerpts`.
+5. Download results as CSV or Excel. Output columns include `row_id`, `question`, `answer`, `answer_status`, `response_seconds`, `source_backlinks`, and proof excerpts.
+
+### Overnight batch workflow (8-12h safe run)
+
+1. In sidebar, enable **Overnight thermal-safe mode**.
+2. Use **Fast** model profile if latency/heat is a concern.
+3. In **Batch Processing** tab:
+   - Upload question Excel/CSV
+   - Select question column
+   - Choose resume mode (`checkpoint`, `append`, or `both`)
+   - (Optional) upload prior answers file for append/re-audit
+4. Click **Create Job**, then **Start / Resume**.
+5. Use **Pause** any time. State is checkpointed in `batch_runs/`.
+6. Use **Stop and Export Now** to safely stop and export partial results.
+7. Later, load the same job with **Load Job** and continue from last checkpoint.
+
+### Resume modes
+
+- `checkpoint`: continue from internal checkpoint (`next_index` + processed row IDs)
+- `append`: skip rows that already exist in prior answers file
+- `both`: combines checkpoint and append skip logic
+
+### Export formats for audit/re-audit
+
+- `answers_only.csv`
+- `answers_only.xlsx`
+- `merge_with_original.xlsx`
+
+All are generated under `batch_runs/<job_id>/` and can be exported mid-run.
+
+### Index export/import
+
+In sidebar **Index Tools**:
+
+- **Export index (.zip)**: packages current `storage/` for transfer/backup
+- **Import index package**: validates package metadata and required files before replacing local storage
+
+Import is blocked when embedding model is incompatible.
+
+### Image OCR indexing (optional)
+
+- Enable **Enable image OCR indexing** before indexing.
+- Supported image types: `.png`, `.jpg`, `.jpeg`, `.tiff`, `.tif`
+- OCR text is indexed with provenance metadata (`source_type=image_ocr`, file name, image page label).
+- This is optional and usually lower power than full audio transcription.
 
 ### Model selection and download
 
@@ -327,6 +384,9 @@ All incidents must be reported to the national CSIRT within 72 hours.
 | Index seems stale after adding new files | Click **Re-index All** in the sidebar |
 | Index compatibility failed | Re-index All (embedding mismatch detected) |
 | Excel download is empty | Ensure you selected the correct question column |
+| Overnight batch interrupted | Load same job from Batch tab and click **Start / Resume** |
+| OCR returns empty text | Ensure image quality is high and Tesseract is installed |
+| `pytesseract` error about binary | Install `tesseract` via Homebrew and restart terminal |
 
 ---
 
@@ -339,6 +399,7 @@ rag_system/
 ├── README.md           ← This file
 ├── data/               ← Uploaded documents (created at runtime)
 └── storage/            ← Persisted vector index (created at runtime)
+└── batch_runs/         ← Checkpointed overnight batch jobs
 ```
 
 ## License
